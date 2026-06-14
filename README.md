@@ -35,10 +35,14 @@ Required for chat:
 
 Required for auth/account forwarding:
 
-- `CODEUS_AUTH_BASE`
+- `UPSTASH_REDIS_REST_URL`
+- `UPSTASH_REDIS_REST_TOKEN`
 
 Optional:
 
+- `CODEUS_DEVICE_APPROVAL_BASE=https://anaxonic.sh`
+- `CODEUS_PUBLIC_API_BASE=https://api.quantumclub.sh`
+- `CODEUS_AUTH_BASE`
 - `CODEUS_ACCOUNT_BASE`
 - `CODEUS_DEVICE_CODE_URL`
 - `CODEUS_DEVICE_TOKEN_URL`
@@ -49,18 +53,14 @@ Optional:
 - `CODEUS_OAUTH_CLIENT_ID=codeus-cli`
 - `CODEUS_OAUTH_SCOPE=chat account usage`
 
-When `CODEUS_AUTH_BASE` points at the Anaxonic website origin during the transition, the proxy
-tries the website API namespace before legacy bare paths:
+By default, `codeus-api` owns the Codeus device-login bridge. It stores pending
+device codes and opaque Codeus session tokens in Upstash Redis, then sends users
+to `CODEUS_DEVICE_APPROVAL_BASE/codeus/link` for browser approval. The Anaxonic
+website proves the user is signed in with Clerk and approves the pending device
+code through `POST /v1/device/link/approve`.
 
-```text
-CODEUS_AUTH_BASE/api/codeus/v1/device/link/init
-CODEUS_AUTH_BASE/api/codeus/v1/device/link/poll
-CODEUS_AUTH_BASE/api/codeus/v1/auth/whoami
-CODEUS_AUTH_BASE/api/codeus/v1/balance
-CODEUS_AUTH_BASE/api/codeus/v1/auth/signout
-```
-
-Use the exact URL overrides when those endpoints live outside the website namespace.
+Use the exact URL overrides only when delegating device auth, account, usage,
+refresh, or sign-out to another service.
 
 Legacy chat gateway routing is disabled by default. To opt in, set
 `CODEUS_ENABLE_LEGACY_LLM_GATEWAY=1` plus `CODEUS_CHAT_BASE` or
@@ -87,6 +87,5 @@ curl -i -X POST https://api.quantumclub.sh/v1/auth/device/code \
 ```
 
 The account request should return `401` without a session token. The device-code request should
-return JSON. A `GET` request to the same route may return `405 Allow: POST`; that only confirms the
-API route exists. An HTML 404 on `POST` means the API project is proxying to a website page rather
-than a JSON auth endpoint.
+return JSON with a `linkUrl` pointing at `/codeus/link`. A `GET` request to the same route may
+return `405 Allow: POST`; that only confirms the API route exists.

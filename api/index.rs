@@ -12,15 +12,31 @@ async fn main() -> Result<(), Error> {
         // Primary Codeus device auth paths.
         .route("/v1/device/link/init", post(vercel_proxy::device_code))
         .route("/v1/device/link/poll", post(vercel_proxy::device_token))
+        .route(
+            "/v1/device/link/approve",
+            post(vercel_proxy::device_approve).options(vercel_proxy::preflight),
+        )
         // Legacy / alternate OAuth paths
         .route("/v1/auth/device/code", post(vercel_proxy::device_code))
         .route("/v1/auth/device/token", post(vercel_proxy::device_token))
+        .route(
+            "/v1/auth/device/approve",
+            post(vercel_proxy::device_approve).options(vercel_proxy::preflight),
+        )
         .route("/v1/auth/refresh", post(vercel_proxy::refresh))
         // Without /v1 prefix (direct hits)
         .route("/device/link/init", post(vercel_proxy::device_code))
         .route("/device/link/poll", post(vercel_proxy::device_token))
+        .route(
+            "/device/link/approve",
+            post(vercel_proxy::device_approve).options(vercel_proxy::preflight),
+        )
         .route("/auth/device/code", post(vercel_proxy::device_code))
         .route("/auth/device/token", post(vercel_proxy::device_token))
+        .route(
+            "/auth/device/approve",
+            post(vercel_proxy::device_approve).options(vercel_proxy::preflight),
+        )
         .route("/auth/refresh", post(vercel_proxy::refresh))
         // --- Chat ---
         .route("/v1/chat/completions", post(vercel_proxy::chat_completions))

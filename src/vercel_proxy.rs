@@ -1,11 +1,15 @@
 use axum::body::{to_bytes, Body};
 use axum::extract::Request;
 use axum::http::{header, Response, StatusCode};
+use base64::Engine;
+use rand::RngCore;
 use serde_json::{json, Map, Value};
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const BODY_LIMIT: usize = 4 * 1024 * 1024;
+const DEVICE_TTL_SECS: u64 = 10 * 60;
+const SESSION_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 const DEVICE_CODE_PATHS: &[&str] = &[
     "api/codeus/v1/device/link/init",
     "device/link/init",
@@ -31,6 +35,8 @@ const REFRESH_PATHS: &[&str] = &[
 const ACCOUNT_PATHS: &[&str] = &["api/codeus/v1/auth/whoami", "auth/whoami"];
 const USAGE_PATHS: &[&str] = &["api/codeus/v1/balance", "balance"];
 const SIGNOUT_PATHS: &[&str] = &["api/codeus/v1/auth/signout", "auth/signout"];
+const CORS_ALLOW_HEADERS: &str = "authorization,content-type";
+const CORS_ALLOW_METHODS: &str = "GET,POST,OPTIONS";
 const DEFAULT_CHAT_MODEL: &str = "anthropic/claude-sonnet-4.6";
 
 #[derive(Debug)]
@@ -81,6 +87,10 @@ pub async fn device_token(request: Request) -> Response<Body> {
     respond(device_token_inner(request).await)
 }
 
+pub async fn device_approve(request: Request) -> Response<Body> {
+    respond(device_approve_inner(request).await)
+}
+
 pub async fn refresh(request: Request) -> Response<Body> {
     respond(refresh_inner(request).await)
 }
@@ -107,8 +117,20 @@ pub async fn fallback() -> Response<Body> {
     )
 }
 
+pub async fn preflight() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, CORS_ALLOW_HEADERS)
+        .header(header::ACCESS_CONTROL_ALLOW_METHODS, CORS_ALLOW_METHODS)
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::empty())
+        .unwrap_or_else(|_| internal_error("failed to build preflight response"))
+}
+
 async fn chat_completions_inner(request: Request) -> Result<Response<Body>, ProxyError> {
     let user_token = require_bearer_token(&request)?;
+    let _session = require_codeus_session(&user_token).await?;
     let body = read_json(request).await?;
     let upstreams = chat_upstream_candidates(true)?;
     let response = post_chat_with_fallback(upstreams, Some(user_token), body).await?;
@@ -117,6 +139,10 @@ async fn chat_completions_inner(request: Request) -> Result<Response<Body>, Prox
 }
 
 async fn device_code_inner(request: Request) -> Result<Response<Body>, ProxyError> {
+    if optional_env("CODEUS_DEVICE_CODE_URL").is_none() {
+        return local_device_code_inner(request).await;
+    }
+
     let auth_urls = configured_url_candidates(
         "CODEUS_DEVICE_CODE_URL",
         "CODEUS_AUTH_BASE",
@@ -163,6 +189,10 @@ async fn device_code_inner(request: Request) -> Result<Response<Body>, ProxyErro
 }
 
 async fn device_token_inner(request: Request) -> Result<Response<Body>, ProxyError> {
+    if optional_env("CODEUS_DEVICE_TOKEN_URL").is_none() {
+        return local_device_token_inner(request).await;
+    }
+
     let auth_urls = configured_url_candidates(
         "CODEUS_DEVICE_TOKEN_URL",
         "CODEUS_AUTH_BASE",
@@ -223,7 +253,226 @@ async fn device_token_inner(request: Request) -> Result<Response<Body>, ProxyErr
     Ok(json_response(StatusCode::OK, upstream))
 }
 
+async fn local_device_code_inner(request: Request) -> Result<Response<Body>, ProxyError> {
+    require_device_store()?;
+    let body = object_body(read_json(request).await?);
+    let now = now_millis();
+    let expires_at = now + (DEVICE_TTL_SECS * 1000);
+    let device_code = random_token(32);
+    let user_code = random_user_code();
+    let account_id = body.get("accountId").cloned().unwrap_or(Value::Null);
+    let record = json!({
+        "status": "pending",
+        "deviceCode": device_code,
+        "userCode": user_code,
+        "accountId": account_id,
+        "createdAt": now,
+        "expiresAt": expires_at,
+    });
+    redis_set_json(&device_key(&device_code), &record, DEVICE_TTL_SECS).await?;
+
+    let approval_base =
+        optional_env("CODEUS_DEVICE_APPROVAL_BASE").unwrap_or_else(|| "https://anaxonic.sh".into());
+    let public_base = optional_env("CODEUS_PUBLIC_API_BASE")
+        .unwrap_or_else(|| "https://api.quantumclub.sh".into());
+    let link_url = format!(
+        "{}/codeus/link?code={}&device_code={}",
+        approval_base.trim_end_matches('/'),
+        user_code,
+        device_code
+    );
+    let poll_url = public_api_url(&public_base, "device/link/poll");
+
+    Ok(json_response(
+        StatusCode::OK,
+        json!({
+            "deviceCode": device_code,
+            "device_code": device_code,
+            "userCode": user_code,
+            "user_code": user_code,
+            "linkUrl": link_url,
+            "verification_uri": link_url,
+            "verification_uri_complete": link_url,
+            "pollUrl": poll_url,
+            "expiresAt": expires_at,
+            "expires_in": DEVICE_TTL_SECS,
+            "interval": 2,
+        }),
+    ))
+}
+
+async fn local_device_token_inner(request: Request) -> Result<Response<Body>, ProxyError> {
+    require_device_store()?;
+    let payload = object_body(read_json(request).await?);
+    let device_code = string_field(&Value::Object(payload), &["deviceCode", "device_code"])
+        .ok_or_else(|| {
+            ProxyError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Missing device code.",
+            )
+        })?;
+    let key = device_key(&device_code);
+    let Some(record) = redis_get_json(&key).await? else {
+        return Ok(device_expired_response());
+    };
+
+    if is_expired(&record) {
+        let _ = redis_del(&key).await;
+        return Ok(device_expired_response());
+    }
+
+    match record.get("status").and_then(Value::as_str) {
+        Some("approved") => Ok(json_response(
+            StatusCode::OK,
+            json!({
+                "status": "approved",
+                "sessionToken": record.get("sessionToken"),
+                "access_token": record.get("sessionToken"),
+                "session_token": record.get("sessionToken"),
+                "token_type": "Bearer",
+                "userId": record.get("userId"),
+                "email": record.get("email"),
+                "expiresAt": record.get("sessionExpiresAt"),
+                "expires_in": expires_in(record.get("sessionExpiresAt")),
+            }),
+        )),
+        Some("denied") => Ok(json_response(
+            StatusCode::GONE,
+            json!({
+                "status": "denied",
+                "error": "access_denied",
+                "error_description": "Browser login was denied.",
+            }),
+        )),
+        _ => Ok(json_response(
+            StatusCode::ACCEPTED,
+            json!({
+                "status": "pending",
+                "error": "authorization_pending",
+                "error_description": "Waiting for browser approval.",
+            }),
+        )),
+    }
+}
+
+async fn device_approve_inner(request: Request) -> Result<Response<Body>, ProxyError> {
+    require_device_store()?;
+    let payload = Value::Object(object_body(read_json(request).await?));
+    let device_code = string_field(&payload, &["deviceCode", "device_code"]).ok_or_else(|| {
+        ProxyError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Missing device code.",
+        )
+    })?;
+    let user_code =
+        string_field(&payload, &["userCode", "user_code", "code"]).ok_or_else(|| {
+            ProxyError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Missing user code.",
+            )
+        })?;
+    let key = device_key(&device_code);
+    let Some(mut record) = redis_get_json(&key).await? else {
+        return Err(ProxyError::new(
+            StatusCode::GONE,
+            "expired_token",
+            "Browser login expired.",
+        ));
+    };
+    if is_expired(&record) {
+        let _ = redis_del(&key).await;
+        return Err(ProxyError::new(
+            StatusCode::GONE,
+            "expired_token",
+            "Browser login expired.",
+        ));
+    }
+    let expected = record.get("userCode").and_then(Value::as_str).unwrap_or("");
+    if normalize_user_code(expected) != normalize_user_code(&user_code) {
+        return Err(ProxyError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_user_code",
+            "The browser login code did not match.",
+        ));
+    }
+
+    if payload
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status.eq_ignore_ascii_case("denied"))
+    {
+        record["status"] = Value::String("denied".to_string());
+        redis_set_json(&key, &record, remaining_device_ttl(&record)).await?;
+        return Ok(json_response(StatusCode::OK, json!({ "status": "denied" })));
+    }
+
+    let upstream_session_token =
+        string_field(&payload, &["sessionToken", "session_token", "access_token"]).ok_or_else(
+            || {
+                ProxyError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "Missing signed-in browser session token.",
+                )
+            },
+        )?;
+    let user_id = string_field(&payload, &["userId", "user_id"]).ok_or_else(|| {
+        ProxyError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Missing user id.",
+        )
+    })?;
+    let email = string_field(&payload, &["email", "userEmail", "user_email"]).unwrap_or_default();
+    let session_token = random_token(32);
+    let session_expires_at = now_millis() + (SESSION_TTL_SECS * 1000);
+    let session = json!({
+        "token": session_token,
+        "upstreamSessionToken": upstream_session_token,
+        "userId": user_id,
+        "email": email,
+        "createdAt": now_millis(),
+        "expiresAt": session_expires_at,
+        "activePlan": "Anaxonic account",
+    });
+    redis_set_json(&session_key(&session_token), &session, SESSION_TTL_SECS).await?;
+
+    record["status"] = Value::String("approved".to_string());
+    record["sessionToken"] = Value::String(session_token);
+    record["userId"] = session.get("userId").cloned().unwrap_or(Value::Null);
+    record["email"] = session.get("email").cloned().unwrap_or(Value::Null);
+    record["sessionExpiresAt"] = Value::Number(session_expires_at.into());
+    redis_set_json(&key, &record, remaining_device_ttl(&record)).await?;
+
+    Ok(json_response(
+        StatusCode::OK,
+        json!({
+            "status": "approved",
+            "userId": session.get("userId"),
+            "email": session.get("email"),
+            "expiresAt": session_expires_at,
+        }),
+    ))
+}
+
 async fn refresh_inner(request: Request) -> Result<Response<Body>, ProxyError> {
+    if optional_env("CODEUS_REFRESH_URL").is_none() {
+        let token = require_bearer_token(&request)?;
+        let session = require_codeus_session(&token).await?;
+        return Ok(json_response(
+            StatusCode::OK,
+            json!({
+                "access_token": token,
+                "session_token": token,
+                "token_type": "Bearer",
+                "expires_in": expires_in(session.get("expiresAt")),
+            }),
+        ));
+    }
+
     let auth_urls =
         configured_url_candidates("CODEUS_REFRESH_URL", "CODEUS_AUTH_BASE", REFRESH_PATHS)?;
     let mut payload = object_body(read_json(request).await?);
@@ -238,6 +487,20 @@ async fn refresh_inner(request: Request) -> Result<Response<Body>, ProxyError> {
 }
 
 async fn account_inner(request: Request) -> Result<Response<Body>, ProxyError> {
+    if optional_env("CODEUS_ACCOUNT_URL").is_none() {
+        let token = require_bearer_token(&request)?;
+        let session = require_codeus_session(&token).await?;
+        return Ok(json_response(
+            StatusCode::OK,
+            json!({
+                "id": session.get("userId"),
+                "userId": session.get("userId"),
+                "email": session.get("email"),
+                "activePlan": session.get("activePlan").and_then(Value::as_str).unwrap_or("Anaxonic account"),
+            }),
+        ));
+    }
+
     let account_urls = configured_account_url_candidates("CODEUS_ACCOUNT_URL", ACCOUNT_PATHS)?;
     let token = bearer_token(&request).ok_or_else(|| {
         ProxyError::new(
@@ -251,6 +514,19 @@ async fn account_inner(request: Request) -> Result<Response<Body>, ProxyError> {
 }
 
 async fn usage_inner(request: Request) -> Result<Response<Body>, ProxyError> {
+    if optional_env("CODEUS_USAGE_URL").is_none() {
+        let token = require_bearer_token(&request)?;
+        let _session = require_codeus_session(&token).await?;
+        return Ok(json_response(
+            StatusCode::OK,
+            json!({
+                "plan": "Anaxonic account",
+                "usage_remaining": null,
+                "remaining": null,
+            }),
+        ));
+    }
+
     let usage_urls = configured_account_url_candidates("CODEUS_USAGE_URL", USAGE_PATHS)?;
     let token = bearer_token(&request).ok_or_else(|| {
         ProxyError::new(
@@ -264,6 +540,16 @@ async fn usage_inner(request: Request) -> Result<Response<Body>, ProxyError> {
 }
 
 async fn signout_inner(request: Request) -> Result<Response<Body>, ProxyError> {
+    if optional_env("CODEUS_SIGNOUT_URL").is_none() {
+        if let Some(token) = bearer_token(&request) {
+            let _ = redis_del(&session_key(&token)).await;
+        }
+        return Ok(json_response(
+            StatusCode::OK,
+            json!({ "status": "signed_out" }),
+        ));
+    }
+
     let signout_urls = configured_account_url_candidates("CODEUS_SIGNOUT_URL", SIGNOUT_PATHS)?;
     let token = bearer_token(&request);
     let client = reqwest::Client::new();
@@ -554,6 +840,131 @@ async fn read_json(request: Request) -> Result<Value, ProxyError> {
     })
 }
 
+async fn require_codeus_session(token: &str) -> Result<Value, ProxyError> {
+    require_device_store()?;
+    let Some(session) = redis_get_json(&session_key(token)).await? else {
+        return Err(ProxyError::new(
+            StatusCode::UNAUTHORIZED,
+            "not_authenticated",
+            "Codeus session is missing or expired.",
+        ));
+    };
+    if is_expired(&session) {
+        let _ = redis_del(&session_key(token)).await;
+        return Err(ProxyError::new(
+            StatusCode::UNAUTHORIZED,
+            "not_authenticated",
+            "Codeus session expired.",
+        ));
+    }
+    Ok(session)
+}
+
+fn require_device_store() -> Result<(), ProxyError> {
+    if redis_base().is_some() && redis_token().is_some() {
+        return Ok(());
+    }
+    Err(ProxyError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "missing_server_config",
+        "Missing Upstash Redis REST configuration. Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN.",
+    ))
+}
+
+async fn redis_set_json(key: &str, value: &Value, ttl_secs: u64) -> Result<(), ProxyError> {
+    let payload = json!(["SET", key, value.to_string(), "EX", ttl_secs]);
+    let response = redis_command(payload).await?;
+    if response.get("error").is_some() {
+        return Err(ProxyError::new(
+            StatusCode::BAD_GATEWAY,
+            "redis_error",
+            response.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn redis_get_json(key: &str) -> Result<Option<Value>, ProxyError> {
+    let response = redis_command(json!(["GET", key])).await?;
+    let Some(raw) = response.get("result") else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let Some(text) = raw.as_str() else {
+        return Err(ProxyError::new(
+            StatusCode::BAD_GATEWAY,
+            "invalid_store_response",
+            "Redis GET returned a non-string value.",
+        ));
+    };
+    serde_json::from_str(text).map(Some).map_err(|_| {
+        ProxyError::new(
+            StatusCode::BAD_GATEWAY,
+            "invalid_store_json",
+            "Stored Codeus session data was not valid JSON.",
+        )
+    })
+}
+
+async fn redis_del(key: &str) -> Result<(), ProxyError> {
+    let _ = redis_command(json!(["DEL", key])).await?;
+    Ok(())
+}
+
+async fn redis_command(command: Value) -> Result<Value, ProxyError> {
+    let base = redis_base().ok_or_else(|| {
+        ProxyError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "missing_server_config",
+            "Missing UPSTASH_REDIS_REST_URL.",
+        )
+    })?;
+    let token = redis_token().ok_or_else(|| {
+        ProxyError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "missing_server_config",
+            "Missing UPSTASH_REDIS_REST_TOKEN.",
+        )
+    })?;
+
+    let response = reqwest::Client::new()
+        .post(base)
+        .bearer_auth(token)
+        .header(header::CONTENT_TYPE.as_str(), "application/json")
+        .json(&command)
+        .send()
+        .await
+        .map_err(upstream_request_error)?;
+    let status = response.status();
+    let text = response.text().await.map_err(upstream_request_error)?;
+    if !status.is_success() {
+        return Err(ProxyError::new(
+            StatusCode::BAD_GATEWAY,
+            "redis_error",
+            format!("Redis command failed ({status}): {}", text.trim()),
+        ));
+    }
+    serde_json::from_str(&text).map_err(|_| {
+        ProxyError::new(
+            StatusCode::BAD_GATEWAY,
+            "invalid_store_response",
+            "Redis response was not valid JSON.",
+        )
+    })
+}
+
+fn redis_base() -> Option<String> {
+    optional_env("UPSTASH_REDIS_REST_URL")
+        .or_else(|| optional_env("KV_REST_API_URL"))
+        .map(|url| url.trim_end_matches('/').to_string())
+}
+
+fn redis_token() -> Option<String> {
+    optional_env("UPSTASH_REDIS_REST_TOKEN").or_else(|| optional_env("KV_REST_API_TOKEN"))
+}
+
 fn optional_env(name: &str) -> Option<String> {
     env::var(name)
         .ok()
@@ -733,6 +1144,94 @@ fn upstream_url(base: &str, path: &str) -> String {
     )
 }
 
+fn public_api_url(base: &str, path_after_v1: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        upstream_url(base, path_after_v1)
+    } else {
+        upstream_url(base, &format!("v1/{path_after_v1}"))
+    }
+}
+
+fn device_key(device_code: &str) -> String {
+    format!("codeus:device:{device_code}")
+}
+
+fn session_key(session_token: &str) -> String {
+    format!("codeus:session:{session_token}")
+}
+
+fn random_token(bytes_len: usize) -> String {
+    let mut bytes = vec![0_u8; bytes_len];
+    rand::rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn random_user_code() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut bytes = [0_u8; 8];
+    rand::rng().fill_bytes(&mut bytes);
+    let code: String = bytes
+        .iter()
+        .map(|byte| ALPHABET[(*byte as usize) % ALPHABET.len()] as char)
+        .collect();
+    format!("{}-{}", &code[..4], &code[4..])
+}
+
+fn normalize_user_code(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn is_expired(value: &Value) -> bool {
+    value
+        .get("expiresAt")
+        .and_then(Value::as_u64)
+        .is_some_and(|expires_at| expires_at <= now_millis())
+}
+
+fn remaining_device_ttl(value: &Value) -> u64 {
+    value
+        .get("expiresAt")
+        .and_then(Value::as_u64)
+        .map(|expires_at| expires_at.saturating_sub(now_millis()).saturating_div(1000))
+        .unwrap_or(DEVICE_TTL_SECS)
+        .max(1)
+}
+
+fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
+    let object = value.as_object()?;
+    keys.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn device_expired_response() -> Response<Body> {
+    json_response(
+        StatusCode::GONE,
+        json!({
+            "status": "expired",
+            "error": "expired_token",
+            "error_description": "Browser login expired.",
+        }),
+    )
+}
+
 fn object_body(value: Value) -> Map<String, Value> {
     match value {
         Value::Object(map) => map,
@@ -802,6 +1301,9 @@ fn json_response(status: StatusCode, body: Value) -> Response<Body> {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, CORS_ALLOW_HEADERS)
+        .header(header::ACCESS_CONTROL_ALLOW_METHODS, CORS_ALLOW_METHODS)
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from(body.to_string()))
         .unwrap_or_else(|_| internal_error("failed to build JSON response"))
@@ -811,6 +1313,9 @@ fn internal_error(message: &'static str) -> Response<Body> {
     Response::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
         .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, CORS_ALLOW_HEADERS)
+        .header(header::ACCESS_CONTROL_ALLOW_METHODS, CORS_ALLOW_METHODS)
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from(
             json!({
@@ -996,6 +1501,18 @@ mod tests {
         assert_eq!(
             candidates.first().map(String::as_str),
             Some("https://account.anaxonic.com/api/codeus/v1/balance")
+        );
+    }
+
+    #[test]
+    fn public_api_url_accepts_base_with_or_without_v1() {
+        assert_eq!(
+            public_api_url("https://api.quantumclub.sh", "device/link/poll"),
+            "https://api.quantumclub.sh/v1/device/link/poll"
+        );
+        assert_eq!(
+            public_api_url("https://api.quantumclub.sh/v1", "device/link/poll"),
+            "https://api.quantumclub.sh/v1/device/link/poll"
         );
     }
 
