@@ -86,10 +86,10 @@ pub async fn fallback() -> Response<Body> {
 }
 
 async fn chat_completions_inner(request: Request) -> Result<Response<Body>, ProxyError> {
-    let user_token = bearer_token(&request);
+    let user_token = require_bearer_token(&request)?;
     let body = read_json(request).await?;
-    let upstreams = chat_upstream_candidates(user_token.is_some())?;
-    let response = post_chat_with_fallback(upstreams, user_token, body).await?;
+    let upstreams = chat_upstream_candidates(true)?;
+    let response = post_chat_with_fallback(upstreams, Some(user_token), body).await?;
 
     Ok(proxy_response(response))
 }
@@ -640,6 +640,16 @@ fn bearer_token(request: &Request) -> Option<String> {
     None
 }
 
+fn require_bearer_token(request: &Request) -> Result<String, ProxyError> {
+    bearer_token(request).ok_or_else(|| {
+        ProxyError::new(
+            StatusCode::UNAUTHORIZED,
+            "not_authenticated",
+            "Missing Codeus session token.",
+        )
+    })
+}
+
 fn upstream_url(base: &str, path: &str) -> String {
     format!(
         "{}/{}",
@@ -820,6 +830,17 @@ mod tests {
 
         assert_eq!(error.code, "missing_server_config");
         assert!(error.message.contains("Vercel AI Gateway"));
+    }
+
+    #[test]
+    fn chat_requires_codeus_session_token_before_using_gateway() {
+        let request = Request::builder().body(Body::empty()).unwrap();
+
+        let error = require_bearer_token(&request).unwrap_err();
+
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error.code, "not_authenticated");
+        assert!(error.message.contains("Missing Codeus session token"));
     }
 
     #[test]
