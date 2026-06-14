@@ -9,7 +9,7 @@ use vercel_runtime::Error;
 async fn main() -> Result<(), Error> {
     let router = Router::new()
         // --- Device login flow ---
-        // Primary website paths (rewritten from /v1/* by middleware)
+        // Primary Codeus device auth paths.
         .route("/v1/device/link/init", post(vercel_proxy::device_code))
         .route("/v1/device/link/poll", post(vercel_proxy::device_token))
         // Legacy / alternate OAuth paths
@@ -25,13 +25,13 @@ async fn main() -> Result<(), Error> {
         // --- Chat ---
         .route("/v1/chat/completions", post(vercel_proxy::chat_completions))
         .route("/chat/completions", post(vercel_proxy::chat_completions))
-        // --- Account (whoami) — matches /api/codeus/v1/auth/whoami on the website ---
+        // --- Account (whoami) ---
         .route("/v1/auth/whoami", get(vercel_proxy::account))
         .route("/auth/whoami", get(vercel_proxy::account))
         // Keep legacy aliases so old CLI builds don't immediately break
         .route("/v1/account", get(vercel_proxy::account))
         .route("/account", get(vercel_proxy::account))
-        // --- Balance (usage) — matches /api/codeus/v1/balance on the website ---
+        // --- Balance (usage) ---
         .route("/v1/balance", get(vercel_proxy::usage))
         .route("/balance", get(vercel_proxy::usage))
         // Keep legacy aliases

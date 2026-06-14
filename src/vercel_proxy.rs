@@ -216,7 +216,7 @@ async fn refresh_inner(request: Request) -> Result<Response<Body>, ProxyError> {
 }
 
 async fn account_inner(request: Request) -> Result<Response<Body>, ProxyError> {
-    // Default to auth/whoami — the website's actual account-info endpoint.
+    // Default to the canonical Codeus auth/account backend path.
     let account_url = configured_account_url("CODEUS_ACCOUNT_URL", "auth/whoami")?;
     let token = bearer_token(&request).ok_or_else(|| {
         ProxyError::new(
@@ -230,7 +230,7 @@ async fn account_inner(request: Request) -> Result<Response<Body>, ProxyError> {
 }
 
 async fn usage_inner(request: Request) -> Result<Response<Body>, ProxyError> {
-    // Default to balance — the website's actual usage/balance endpoint.
+    // Default to the canonical Codeus balance/usage backend path.
     let usage_url = configured_account_url("CODEUS_USAGE_URL", "balance")?;
     let token = bearer_token(&request).ok_or_else(|| {
         ProxyError::new(
