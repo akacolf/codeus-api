@@ -1,0 +1,38 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    {
+      "source": "/v1/:path*",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/auth/:path*",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/device/:path*",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/chat/:path*",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/account",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/balance",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/usage",
+      "destination": "/api/index"
+    }
+  ],
+  "functions": {
+    "api/index.rs": {
+      "maxDuration": 60
+    }
+  }
+}
