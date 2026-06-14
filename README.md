@@ -1,4 +1,4 @@
-# Codeus API Vercel Split
+## Codeus API Vercel Split
 
 The API should be its own Vercel project once it serves more than the CLI. Keeping it inside the website is acceptable for a short transition, but it couples chat/auth availability to website deploys, rewrites, and rollback decisions.
 
