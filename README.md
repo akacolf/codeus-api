@@ -49,6 +49,19 @@ Optional:
 - `CODEUS_OAUTH_CLIENT_ID=codeus-cli`
 - `CODEUS_OAUTH_SCOPE=chat account usage`
 
+When `CODEUS_AUTH_BASE` points at the Anaxonic website origin during the transition, the proxy
+tries the website API namespace before legacy bare paths:
+
+```text
+CODEUS_AUTH_BASE/api/codeus/v1/device/link/init
+CODEUS_AUTH_BASE/api/codeus/v1/device/link/poll
+CODEUS_AUTH_BASE/api/codeus/v1/auth/whoami
+CODEUS_AUTH_BASE/api/codeus/v1/balance
+CODEUS_AUTH_BASE/api/codeus/v1/auth/signout
+```
+
+Use the exact URL overrides when those endpoints live outside the website namespace.
+
 Legacy chat gateway routing is disabled by default. To opt in, set
 `CODEUS_ENABLE_LEGACY_LLM_GATEWAY=1` plus `CODEUS_CHAT_BASE` or
 `CODEUS_CHAT_COMPLETIONS_URL`.
@@ -68,6 +81,12 @@ Yes: remove `api.quantumclub.sh` from the website project and add it to the
 
 ```bash
 curl -i https://api.quantumclub.sh/v1/account
+curl -i -X POST https://api.quantumclub.sh/v1/auth/device/code \
+  -H 'content-type: application/json' \
+  --data '{"client_id":"codeus-cli","client_name":"Codeus CLI","scope":"chat account usage"}'
 ```
 
-The account request should return `401` without a session token.
+The account request should return `401` without a session token. The device-code request should
+return JSON. A `GET` request to the same route may return `405 Allow: POST`; that only confirms the
+API route exists. An HTML 404 on `POST` means the API project is proxying to a website page rather
+than a JSON auth endpoint.

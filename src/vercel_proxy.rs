@@ -6,9 +6,31 @@ use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const BODY_LIMIT: usize = 4 * 1024 * 1024;
-const DEVICE_CODE_PATHS: &[&str] = &["device/link/init", "oauth/device/code", "device/code"];
-const DEVICE_TOKEN_PATHS: &[&str] = &["device/link/poll", "oauth/token", "device/token"];
-const REFRESH_PATHS: &[&str] = &["oauth/token", "refresh"];
+const DEVICE_CODE_PATHS: &[&str] = &[
+    "api/codeus/v1/device/link/init",
+    "device/link/init",
+    "api/codeus/v1/oauth/device/code",
+    "oauth/device/code",
+    "api/codeus/v1/device/code",
+    "device/code",
+];
+const DEVICE_TOKEN_PATHS: &[&str] = &[
+    "api/codeus/v1/device/link/poll",
+    "device/link/poll",
+    "api/codeus/v1/oauth/token",
+    "oauth/token",
+    "api/codeus/v1/device/token",
+    "device/token",
+];
+const REFRESH_PATHS: &[&str] = &[
+    "api/codeus/v1/oauth/token",
+    "oauth/token",
+    "api/codeus/v1/refresh",
+    "refresh",
+];
+const ACCOUNT_PATHS: &[&str] = &["api/codeus/v1/auth/whoami", "auth/whoami"];
+const USAGE_PATHS: &[&str] = &["api/codeus/v1/balance", "balance"];
+const SIGNOUT_PATHS: &[&str] = &["api/codeus/v1/auth/signout", "auth/signout"];
 const DEFAULT_CHAT_MODEL: &str = "anthropic/claude-sonnet-4.6";
 
 #[derive(Debug)]
@@ -216,8 +238,7 @@ async fn refresh_inner(request: Request) -> Result<Response<Body>, ProxyError> {
 }
 
 async fn account_inner(request: Request) -> Result<Response<Body>, ProxyError> {
-    // Default to the canonical Codeus auth/account backend path.
-    let account_url = configured_account_url("CODEUS_ACCOUNT_URL", "auth/whoami")?;
+    let account_urls = configured_account_url_candidates("CODEUS_ACCOUNT_URL", ACCOUNT_PATHS)?;
     let token = bearer_token(&request).ok_or_else(|| {
         ProxyError::new(
             StatusCode::UNAUTHORIZED,
@@ -226,12 +247,11 @@ async fn account_inner(request: Request) -> Result<Response<Body>, ProxyError> {
         )
     })?;
 
-    proxy_get(account_url, token).await
+    proxy_get_candidates(account_urls, token).await
 }
 
 async fn usage_inner(request: Request) -> Result<Response<Body>, ProxyError> {
-    // Default to the canonical Codeus balance/usage backend path.
-    let usage_url = configured_account_url("CODEUS_USAGE_URL", "balance")?;
+    let usage_urls = configured_account_url_candidates("CODEUS_USAGE_URL", USAGE_PATHS)?;
     let token = bearer_token(&request).ok_or_else(|| {
         ProxyError::new(
             StatusCode::UNAUTHORIZED,
@@ -240,26 +260,37 @@ async fn usage_inner(request: Request) -> Result<Response<Body>, ProxyError> {
         )
     })?;
 
-    proxy_get(usage_url, token).await
+    proxy_get_candidates(usage_urls, token).await
 }
 
 async fn signout_inner(request: Request) -> Result<Response<Body>, ProxyError> {
-    let signout_url = configured_account_url("CODEUS_SIGNOUT_URL", "auth/signout")?;
+    let signout_urls = configured_account_url_candidates("CODEUS_SIGNOUT_URL", SIGNOUT_PATHS)?;
     let token = bearer_token(&request);
+    let client = reqwest::Client::new();
+    let last_index = signout_urls.len().saturating_sub(1);
 
-    let mut builder = reqwest::Client::new()
-        .post(&signout_url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json");
-    if let Some(token) = token {
-        builder = builder.bearer_auth(token);
+    for (index, signout_url) in signout_urls.into_iter().enumerate() {
+        let mut builder = client
+            .post(&signout_url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token.as_ref() {
+            builder = builder.bearer_auth(token);
+        }
+        let response = builder
+            .body("{}")
+            .send()
+            .await
+            .map_err(upstream_request_error)?;
+        if response.status() != reqwest::StatusCode::NOT_FOUND || index == last_index {
+            return Ok(proxy_response(response));
+        }
     }
-    let response = builder
-        .body("{}")
-        .send()
-        .await
-        .map_err(upstream_request_error)?;
 
-    Ok(proxy_response(response))
+    Err(ProxyError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "missing_server_config",
+        "No upstream URLs were configured.",
+    ))
 }
 
 async fn proxy_json_post_candidates(
@@ -435,15 +466,31 @@ fn body_with_default_model(body: &Value) -> Value {
     retry
 }
 
-async fn proxy_get(url: String, token: String) -> Result<Response<Body>, ProxyError> {
-    let response = reqwest::Client::new()
-        .get(url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(upstream_request_error)?;
+async fn proxy_get_candidates(
+    urls: Vec<String>,
+    token: String,
+) -> Result<Response<Body>, ProxyError> {
+    let client = reqwest::Client::new();
+    let last_index = urls.len().saturating_sub(1);
 
-    Ok(proxy_response(response))
+    for (index, url) in urls.into_iter().enumerate() {
+        let response = client
+            .get(url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(upstream_request_error)?;
+
+        if response.status() != reqwest::StatusCode::NOT_FOUND || index == last_index {
+            return Ok(proxy_response(response));
+        }
+    }
+
+    Err(ProxyError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "missing_server_config",
+        "No upstream URLs were configured.",
+    ))
 }
 
 fn proxy_response(response: reqwest::Response) -> Response<Body> {
@@ -507,16 +554,6 @@ async fn read_json(request: Request) -> Result<Value, ProxyError> {
     })
 }
 
-fn require_env(name: &'static str) -> Result<String, ProxyError> {
-    optional_env(name).ok_or_else(|| {
-        ProxyError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "missing_server_config",
-            format!("Missing required server environment variable: {name}."),
-        )
-    })
-}
-
 fn optional_env(name: &str) -> Option<String> {
     env::var(name)
         .ok()
@@ -529,11 +566,29 @@ fn configured_url_candidates(
     base_name: &'static str,
     paths: &[&str],
 ) -> Result<Vec<String>, ProxyError> {
-    if let Some(url) = optional_env(override_name) {
+    configured_url_candidates_from_lookup(override_name, base_name, paths, optional_env)
+}
+
+fn configured_url_candidates_from_lookup<F>(
+    override_name: &str,
+    base_name: &'static str,
+    paths: &[&str],
+    mut lookup: F,
+) -> Result<Vec<String>, ProxyError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    if let Some(url) = lookup(override_name) {
         return Ok(vec![url]);
     }
 
-    let base = require_env(base_name)?;
+    let base = lookup(base_name).ok_or_else(|| {
+        ProxyError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "missing_server_config",
+            format!("Missing required server environment variable: {base_name}."),
+        )
+    })?;
     Ok(paths.iter().map(|path| upstream_url(&base, path)).collect())
 }
 
@@ -612,15 +667,35 @@ where
     )
 }
 
-fn configured_account_url(override_name: &str, path: &str) -> Result<String, ProxyError> {
-    if let Some(url) = optional_env(override_name) {
-        return Ok(url);
+fn configured_account_url_candidates(
+    override_name: &str,
+    paths: &[&str],
+) -> Result<Vec<String>, ProxyError> {
+    configured_account_url_candidates_from_lookup(override_name, paths, optional_env)
+}
+
+fn configured_account_url_candidates_from_lookup<F>(
+    override_name: &str,
+    paths: &[&str],
+    mut lookup: F,
+) -> Result<Vec<String>, ProxyError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    if let Some(url) = lookup(override_name) {
+        return Ok(vec![url]);
     }
 
-    let base = optional_env("CODEUS_ACCOUNT_BASE")
-        .map(Ok)
-        .unwrap_or_else(|| require_env("CODEUS_AUTH_BASE"))?;
-    Ok(upstream_url(&base, path))
+    let base = lookup("CODEUS_ACCOUNT_BASE").map(Ok).unwrap_or_else(|| {
+        lookup("CODEUS_AUTH_BASE").ok_or_else(|| {
+            ProxyError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "missing_server_config",
+                "Missing required server environment variable: CODEUS_AUTH_BASE.",
+            )
+        })
+    })?;
+    Ok(paths.iter().map(|path| upstream_url(&base, path)).collect())
 }
 
 fn bearer_token(request: &Request) -> Option<String> {
@@ -841,6 +916,87 @@ mod tests {
         assert_eq!(error.status, StatusCode::UNAUTHORIZED);
         assert_eq!(error.code, "not_authenticated");
         assert!(error.message.contains("Missing Codeus session token"));
+    }
+
+    #[test]
+    fn device_code_candidates_try_website_api_namespace_first() {
+        let env = HashMap::from([("CODEUS_AUTH_BASE", "https://anaxonic.com")]);
+
+        let candidates = configured_url_candidates_from_lookup(
+            "CODEUS_DEVICE_CODE_URL",
+            "CODEUS_AUTH_BASE",
+            DEVICE_CODE_PATHS,
+            |key| env.get(key).map(|value| value.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            candidates.first().map(String::as_str),
+            Some("https://anaxonic.com/api/codeus/v1/device/link/init")
+        );
+        assert!(candidates
+            .iter()
+            .any(|url| url == "https://anaxonic.com/device/link/init"));
+    }
+
+    #[test]
+    fn exact_device_code_url_override_disables_fallback_candidates() {
+        let env = HashMap::from([
+            ("CODEUS_AUTH_BASE", "https://anaxonic.com"),
+            (
+                "CODEUS_DEVICE_CODE_URL",
+                "https://auth.anaxonic.com/device/code",
+            ),
+        ]);
+
+        let candidates = configured_url_candidates_from_lookup(
+            "CODEUS_DEVICE_CODE_URL",
+            "CODEUS_AUTH_BASE",
+            DEVICE_CODE_PATHS,
+            |key| env.get(key).map(|value| value.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(candidates, vec!["https://auth.anaxonic.com/device/code"]);
+    }
+
+    #[test]
+    fn account_candidates_try_website_api_namespace_first() {
+        let env = HashMap::from([("CODEUS_AUTH_BASE", "https://anaxonic.com")]);
+
+        let candidates = configured_account_url_candidates_from_lookup(
+            "CODEUS_ACCOUNT_URL",
+            ACCOUNT_PATHS,
+            |key| env.get(key).map(|value| value.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            candidates,
+            vec![
+                "https://anaxonic.com/api/codeus/v1/auth/whoami",
+                "https://anaxonic.com/auth/whoami"
+            ]
+        );
+    }
+
+    #[test]
+    fn account_base_overrides_auth_base_for_account_candidates() {
+        let env = HashMap::from([
+            ("CODEUS_AUTH_BASE", "https://anaxonic.com"),
+            ("CODEUS_ACCOUNT_BASE", "https://account.anaxonic.com"),
+        ]);
+
+        let candidates =
+            configured_account_url_candidates_from_lookup("CODEUS_USAGE_URL", USAGE_PATHS, |key| {
+                env.get(key).map(|value| value.to_string())
+            })
+            .unwrap();
+
+        assert_eq!(
+            candidates.first().map(String::as_str),
+            Some("https://account.anaxonic.com/api/codeus/v1/balance")
+        );
     }
 
     #[test]
