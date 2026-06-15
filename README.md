@@ -1,4 +1,4 @@
-## Codeus API
+### Codeus API
 
 Standalone Vercel API for Codeus clients.
 
