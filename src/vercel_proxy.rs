@@ -271,8 +271,8 @@ async fn local_device_code_inner(request: Request) -> Result<Response<Body>, Pro
     });
     redis_set_json(&device_key(&device_code), &record, DEVICE_TTL_SECS).await?;
 
-    let approval_base =
-        optional_env("CODEUS_DEVICE_APPROVAL_BASE").unwrap_or_else(|| "https://anaxonic.sh".into());
+    let approval_base = optional_env("CODEUS_DEVICE_APPROVAL_BASE")
+        .unwrap_or_else(|| "https://quantumclub.sh".into());
     let public_base = optional_env("CODEUS_PUBLIC_API_BASE")
         .unwrap_or_else(|| "https://api.quantumclub.sh".into());
     let link_url = format!(

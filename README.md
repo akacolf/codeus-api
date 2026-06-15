@@ -40,7 +40,7 @@ Required for auth/account forwarding:
 
 Optional:
 
-- `CODEUS_DEVICE_APPROVAL_BASE=https://anaxonic.sh`
+- `CODEUS_DEVICE_APPROVAL_BASE=https://quantumclub.sh`
 - `CODEUS_PUBLIC_API_BASE=https://api.quantumclub.sh`
 - `CODEUS_AUTH_BASE`
 - `CODEUS_ACCOUNT_BASE`
@@ -54,10 +54,10 @@ Optional:
 - `CODEUS_OAUTH_SCOPE=chat account usage`
 
 By default, `codeus-api` owns the Codeus device-login bridge. It stores pending
-device codes and opaque Codeus session tokens in Upstash Redis, then sends users
-to `CODEUS_DEVICE_APPROVAL_BASE/codeus/link` for browser approval. The Anaxonic
-website proves the user is signed in with Clerk and approves the pending device
-code through `POST /v1/device/link/approve`.
+device codes and opaque Codeus session tokens in Vercel KV/Upstash Redis, then
+sends users to `CODEUS_DEVICE_APPROVAL_BASE/codeus/link` for browser approval.
+The website proves the user is signed in with Clerk and approves the pending
+device code through `POST /v1/device/link/approve`.
 
 Use the exact URL overrides only when delegating device auth, account, usage,
 refresh, or sign-out to another service.
